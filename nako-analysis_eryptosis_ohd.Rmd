@@ -1,0 +1,616 @@
+---
+title: 'NAKO: Statistical Analyses'
+author: "Marvin Schmitt"
+subtitle: Eryptosis, OHD, Gender, Age
+output:
+  html_document:
+    code_folding: hide
+  pdf_document: default
+  word_document: default
+---
+
+<!--```{r}
+fit_anova = brm(eryptosis ~ OHD_grp,
+                data = df)
+summary(fit_anova)
+plot(fit_anova)
+conditional_effects(fit_anova, ask=FALSE)
+```-->
+
+
+
+```{r, echo=FALSE, results=FALSE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+
+library(dplyr)
+library(magrittr)
+library(tidyr)
+library(ggplot2)
+library(ggpubr)
+library(viridis)
+library(eeptools)
+library(brms)
+library(readxl)
+library(loo)
+library(psych)
+library(haven)
+library(patchwork)
+library(lubridate)
+library(forcats)
+library(viridisLite)
+library(stringr)
+library(broom.mixed)
+library(here)
+library(bayesplot)
+
+viridis_option = "magma"
+
+dpi_value = 1200
+
+set.seed(127)
+options(scipen=999)
+
+viridis_begin = 0.4
+viridis_end = 0.8
+binary_colors = viridis(2, alpha = 1, begin=viridis_begin, end=viridis_end, option = viridis_option)
+
+ggplot2::theme_set(ggpubr::theme_pubr())
+```
+
+<!--```{r}
+library(corrplot)
+readxl::read_xlsx("data/nako_stangl_pseudonym_v2_Ausschluss.xlsx", guess_max=2000) %>% 
+  select(where(is.numeric)) %>% 
+  select(-anthro_hueftumfang) %>% 
+  cor(use = "pairwise.complete.obs") %>% 
+  corrplot(.)
+```-->
+
+
+
+## Data reading, cleaning, and pre-processing
+
+Cases are dropped if at least one of the following protocol codes is violated: blood sample hemolysis, blood sample coagulation, inadequate storage, or insufficient sample volume.
+
+The `eryptosis` measure is obtained by calculating the average of `eryptosis_1` and `eryptosis_2` if both measurements are available, or`eryptosis_1` if the mean is already noted in the data set.
+
+Invalid 25(OH)D2 measurements under the detection threshold $\delta=1$ as well as missing values are replaced by a sample from the uniform distribution over the interval $[0,1]$.
+Extreme values (median $\pm 3\cdot$ IQR) are omitted.
+
+
+```{r, eval=TRUE, echo=FALSE}
+uniform_if_below_threshold <- function(x, threshold=1.0){
+  N = length(x)
+  if (N == 1){
+    x_out = ifelse(x < threshold,runif(n=1, min=0, max=threshold), x)
+  }
+  else{
+    x_out = vector(mode = "numeric", length = N)
+    for (i in 1:N){
+      x_out[i] = ifelse(x[i] < threshold,runif(n=1, min=0, max=threshold), x[i])
+    }
+  }
+  return(x_out)
+}
+
+uniform_if_NA <- function(x){
+  N = length(x)
+  if (N == 1){
+    x_out = ifelse(is.na(x),runif(n=1, min=0, max=1), x)
+  }
+  else{
+    x_out = vector(mode = "numeric", length = N)
+    for (i in 1:N){
+      x_out[i] = ifelse(is.na(x[i]),runif(n=1, min=0, max=1), x[i])
+    }
+  }
+  return(x_out)
+}
+
+df = readxl::read_xlsx(here("data", "nako_stangl_pseudonym_v4_Ausschluss.xlsx")) %>% 
+  dplyr::rename(
+    date = "ci_beg",
+    gender = "ci_sex",
+    date_of_birth = "ci_gebdat",
+    eryptosis_1 = "Eryptose_1",
+    eryptosis_2 = "Eryptose_2",
+    reticulocytes = "Retikulozyten",
+    BMI = "anthro_BMI",
+    comment = "Bemerkungen",
+    tobacco = "d_tab_fu_tbk_w30",
+    ID = "newId"
+  )  %>% 
+  mutate(running_id = 1:n()) %>% 
+  dplyr::mutate(gender = factor(gender,
+    levels = c(1, 2),
+    labels = c("male", "female")
+  )) %>% 
+  dplyr::mutate(eryptosis = if_else(is.na(eryptosis_2),
+                            eryptosis_1,
+                            (eryptosis_1 + eryptosis_2)/2
+                            )) %>% 
+  dplyr::mutate(date = as.Date(date)) %>% 
+  dplyr::mutate(month = months(date)) %>% 
+  dplyr::mutate(month_no = lubridate::month(date, label=FALSE)) %>% 
+  dplyr::mutate(season = case_when(month %in% c("March", "April", "May") ~ "spring",  
+                            month %in% c("June", "July", "August") ~ "summer", 
+                            month %in% c("September", "October", "November") ~ "autumn", 
+                            month %in% c("December", "January", "February")~ "winter")) %>% 
+  dplyr::mutate(day = as.numeric(date - min(date, na.rm=TRUE))) %>% 
+  dplyr::mutate(date_of_birth = as.Date(date_of_birth)) %>% 
+  dplyr::mutate(age = age_calc(date_of_birth, date, units = "years")) %>% 
+  dplyr::mutate(OHD2a = uniform_if_below_threshold(x=OHD2, threshold=1.0)) %>% 
+  dplyr::mutate(OHD2b = uniform_if_NA(x=OHD2a)) %>% 
+  dplyr::mutate(OHD_grp = case_when(
+    OHD3 < 12 ~ "deficient",
+    (12 <= OHD3 & OHD3 < 20) ~ "insufficient",
+    OHD3 >= 20 ~ "adequate"
+  )
+  ) %>% 
+  dplyr::mutate(BMI_grp = case_when(
+    BMI <= 25 ~ "normal",
+    (25 < BMI & BMI < 30) ~ "overweight",
+    BMI >= 30 ~ "obese"
+  )) %>% 
+  dplyr::filter(is.na(Ausschluss)) %>% 
+  dplyr::filter(age != 0) %>% 
+  dplyr::filter(log(eryptosis) < median(log(eryptosis), na.rm=TRUE) + 3 * IQR(log(eryptosis), na.rm=TRUE) &
+         log(eryptosis) > median(log(eryptosis), na.rm=TRUE) - 3 * IQR(log(eryptosis), na.rm=TRUE)) %>% 
+  dplyr::filter(OHD3 < median(OHD3, na.rm=TRUE) + 3 * IQR(OHD3, na.rm=TRUE) &
+         OHD3 > median(OHD3, na.rm=TRUE) - 3 * IQR(OHD3, na.rm=TRUE))  %>% 
+  dplyr::mutate(OHD = (OHD3 + OHD2b) * 2.5) %>% # mmol/l now
+  dplyr::mutate(across(tobacco, ~ factor(.))) %>% 
+  dplyr::mutate(across(tobacco, ~ dplyr::recode_factor(., `2` = "no-smoker", `11` = "smoker", `12` = "ex-smoker"))) #%>% 
+  #dplyr::left_join(., df_u2, by = "ID") # add u2_ columns, but keep Ausschluss mask by *left* join
+
+#remove(df_u2)
+
+n_spline_bases = ceiling(max(df$day) / 30)
+```
+
+```{r}
+OHD2_measurement_group = case_when(
+    is.na(df$OHD2) ~ "NA",
+    df$OHD2<1 ~ "below LLOQ",
+    df$OHD2 >= 1 ~ "valid"
+  )
+
+table(OHD2_measurement_group)
+```
+
+
+
+## Sample attributes
+
+The sample consists of `r nrow(df)` valid subjects.
+
+Descriptive statistics:
+
+```{r}
+df %>% 
+  dplyr::select(age, eryptosis, OHD, BMI, reticulocytes, u2_erythrozyten, u2_haematokrit, u2_haemoglobin) %>% 
+  psych::describe() %>% 
+  dplyr::select(n, mean, sd, median, min, max)
+
+df %>% 
+  dplyr::select(age, eryptosis, OHD, BMI, reticulocytes, u2_erythrozyten, u2_haematokrit, u2_haemoglobin) %>%
+  as.matrix() %>% 
+  apply(., 2, IQR, na.rm=TRUE) %>% round(2)
+```
+
+```{r}
+table(df$gender)
+```
+
+
+```{r}
+table(is.na(df$OHD2))
+
+table(df$OHD2<1)
+```
+
+
+```{r}
+table(df$OHD_grp)
+```
+
+```{r}
+table(df$BMI_grp)
+```
+
+```{r}
+table(df$tobacco)
+```
+
+## Marginal analyses
+
+```{r}
+regression_correlation_marginal_hist_plot = function(data, 
+                                                     formula_corr,
+                                                     formula_reg,
+                                                     conditional_effect_label,
+                                                     xlabel="",
+                                                     ylabel="",
+                                                     filename="plot.pdf",
+                                                     title="",
+                                                     color = "black",
+                                                     xmin=NA, xmax=NA, ymin=NA, ymax=NA
+                                                     ){
+
+m_ohd_eryptosis_all_corr = brm(
+  formula_corr,
+  data = data,
+  cores = 4, iter = 3000, warmup=1000, refresh=0
+)
+m_ohd_eryptosis_all_reg = brm(
+  formula_reg,
+  data = data,
+  cores = 4, iter = 3000, warmup=1000, refresh=0
+)
+
+r_est = summary(m_ohd_eryptosis_all_corr)$rescor_pars$Estimate %>% round(2)
+r_lowerci = summary(m_ohd_eryptosis_all_corr)$rescor_pars$`l-95% CI` %>% round(2)
+r_upperci = summary(m_ohd_eryptosis_all_corr)$rescor_pars$`u-95% CI` %>% round(2)
+
+p = plot(conditional_effects(m_ohd_eryptosis_all_reg, conditional_effect_label), 
+         points=TRUE, ask=FALSE, plot=FALSE,
+         point_args = list(alpha=0.3, pch=16, color=color),
+         line_args = list(color="blue", fill="darkgray"))[[1]] +
+  scale_x_continuous(expand = c(0, 0), limits = c(xmin, xmax)) + 
+  scale_y_continuous(expand = c(0, 0), limits = c(ymin, ymax)) +
+  labs(x = xlabel,
+       y = ylabel,
+       title=title) +
+  annotate("text", x = xmin + ((xmax-xmin)/2), y = 0.925*ymax, label = paste0("r = ", r_est %>% format(nsmall=2), 
+                                                  ", 95% CI [", r_lowerci %>% format(nsmall=2), ", ", 
+                                                  r_upperci %>% format(nsmall=2), "]"), size=4.5)
+p = ggExtra::ggMarginal(p, type = "densigram", fill=color)
+
+ggsave(filename=filename, plot=p, width=4, height=4, dpi=dpi_value)
+}
+
+```
+
+```{r}
+regression_correlation_marginal_hist_plot(data = df, 
+                                          formula_corr = bf(mvbind(eryptosis, OHD) ~ 1) + set_rescor(TRUE),
+                                          formula_reg = bf(eryptosis ~ OHD),
+                                          conditional_effect_label = "OHD",
+                                          xlabel = "25(OH)D [nmol/l]",
+                                          ylabel = "Eryptosis [%]",
+                                          color="gray",
+                                          title="total subcohort",
+                                          filename=here("eryptosis_ohd", 
+                                                        "plots", 
+                                                        "ohd_eryptosis_regression_all.tiff"),
+                                          xmin=0, xmax=160, ymin=0, ymax=6.5)
+regression_correlation_marginal_hist_plot(data = df %>% filter(gender=="male"), 
+                                          formula_corr = bf(mvbind(eryptosis, OHD) ~ 1) + set_rescor(TRUE),
+                                          formula_reg = bf(eryptosis ~ OHD),
+                                          conditional_effect_label = "OHD",
+                                          xlabel = "25(OH)D [nmol/l]",
+                                          ylabel = "Eryptosis [%]",
+                                          color = binary_colors[1],
+                                          title="male",
+                                          filename=here("eryptosis_ohd", 
+                                                        "plots", 
+                                                        "ohd_eryptosis_regression_male.tiff"),
+                                          xmin=0, xmax=160, ymin=0, ymax=6.5)
+regression_correlation_marginal_hist_plot(data = df %>% filter(gender=="female"), 
+                                          formula_corr = bf(mvbind(eryptosis, OHD) ~ 1) + set_rescor(TRUE),
+                                          formula_reg = bf(eryptosis ~ OHD),
+                                          conditional_effect_label = "OHD",
+                                          xlabel = "25(OH)D [nmol/l]",
+                                          ylabel = "Eryptosis [%]",
+                                          color = binary_colors[2],
+                                          title="female",
+                                          filename=here("eryptosis_ohd", 
+                                                        "plots", 
+                                                        "ohd_eryptosis_regression_female.tiff"),
+                                          xmin=0, xmax=160, ymin=0, ymax=6.5)
+```
+
+
+```{r}
+
+df %>% drop_na(any_of(c("eryptosis", "OHD"))) %>% nrow()
+df %>% drop_na(any_of(c("eryptosis", "OHD"))) %>% filter(gender=="male") %>% nrow()
+df %>% drop_na(any_of(c("eryptosis", "OHD"))) %>% filter(gender=="female") %>% nrow()
+
+regression_correlation_marginal_hist_plot(data = df %>% filter(OHD_grp=="deficient"), 
+                                          formula_corr = bf(mvbind(eryptosis, reticulocytes) ~ 1) + set_rescor(TRUE),
+                                          formula_reg  = bf(eryptosis ~ reticulocytes),
+                                          conditional_effect_label = "reticulocytes",
+                                          xlabel = "Reticolucyte Count [%]",
+                                          ylabel = "Eryptosis [%]",
+                                          color="firebrick",
+                                          title="25(OH)D: deficient",
+                                          filename=here("eryptosis_ohd", 
+                                                        "plots", 
+                                                        "reticulocytes_eryptosis_regression_ohd_deficient.tiff"),
+                                          xmin=0, xmax=5, ymin=0, ymax=6.5)
+
+regression_correlation_marginal_hist_plot(data = df %>% filter(OHD_grp=="insufficient"), 
+                                          formula_corr = bf(mvbind(eryptosis, reticulocytes) ~ 1) + set_rescor(TRUE),
+                                          formula_reg  = bf(eryptosis ~ reticulocytes),
+                                          conditional_effect_label = "reticulocytes",
+                                          xlabel = "Reticolucyte Count [%]",
+                                          ylabel = "Eryptosis [%]",
+                                          color="orange",
+                                          title="25(OH)D: insufficient",
+                                          filename=here("eryptosis_ohd", 
+                                                        "plots", 
+                                                        "reticulocytes_eryptosis_regression_ohd_insufficient.tiff"),
+                                          xmin=0, xmax=5, ymin=0, ymax=6.5)
+
+regression_correlation_marginal_hist_plot(data = df %>% filter(OHD_grp=="adequate"), 
+                                          formula_corr = bf(mvbind(eryptosis, reticulocytes) ~ 1) + set_rescor(TRUE),
+                                          formula_reg  = bf(eryptosis ~ reticulocytes),
+                                          conditional_effect_label = "reticulocytes",
+                                          xlabel = "Reticolucyte Count [%]",
+                                          ylabel = "Eryptosis [%]",
+                                          color="forestgreen",
+                                          title="25(OH)D: adequate",
+                                          filename=here("eryptosis_ohd", 
+                                                        "plots", 
+                                                        "reticulocytes_eryptosis_regression_ohd_adequate.tiff"),
+                                          xmin=0, xmax=5, ymin=0, ymax=6.5)
+```
+
+
+```{r}
+
+df %>% drop_na(any_of(c("eryptosis", "reticulocytes"))) %>% nrow()
+df %>% drop_na(any_of(c("eryptosis", "reticulocytes"))) %>% filter(gender=="male") %>% nrow()
+df %>% drop_na(any_of(c("eryptosis", "reticulocytes"))) %>% filter(gender=="female") %>% nrow()
+
+regression_correlation_marginal_hist_plot(data = df, 
+                                          formula_corr = bf(mvbind(eryptosis, reticulocytes) ~ 1) + set_rescor(TRUE),
+                                          formula_reg = bf(eryptosis ~ reticulocytes),
+                                          conditional_effect_label = "reticulocytes",
+                                          xlabel = "Reticulocyte Count [%]",
+                                          ylabel = "Eryptosis [%]",
+                                          color="gray",
+                                          title="total subcohort",
+                                          filename=here("eryptosis_ohd", 
+                                                        "plots", 
+                                                        "reticulocytes_eryptosis_regression_all.tiff"),
+                                          xmin=0, xmax=5, ymin=0, ymax=6.5)
+regression_correlation_marginal_hist_plot(data = df %>% filter(gender=="male"), 
+                                          formula_corr = bf(mvbind(eryptosis, reticulocytes) ~ 1) + set_rescor(TRUE),
+                                          formula_reg = bf(eryptosis ~ reticulocytes),
+                                          conditional_effect_label = "reticulocytes",
+                                          xlabel = "Reticulocyte Count [%]",
+                                          ylabel = "Eryptosis [%]",
+                                          color = binary_colors[1],
+                                          title="male",
+                                          filename=here("eryptosis_ohd", 
+                                                        "plots", 
+                                                        "reticulocytes_eryptosis_regression_male.tiff"),
+                                          xmin=0, xmax=5, ymin=0, ymax=6.5)
+regression_correlation_marginal_hist_plot(data = df %>% filter(gender=="female"), 
+                                          formula_corr = bf(mvbind(eryptosis, reticulocytes) ~ 1) + set_rescor(TRUE),
+                                          formula_reg = bf(eryptosis ~ reticulocytes),
+                                          conditional_effect_label = "reticulocytes",
+                                          xlabel = "Reticulocyte Count [%]",
+                                          ylabel = "Eryptosis [%]",
+                                          color = binary_colors[2],
+                                          title="female",
+                                          filename=here("eryptosis_ohd", 
+                                                        "plots", 
+                                                        "reticulocytes_eryptosis_regression_female.tiff"),
+                                          xmin=0, xmax=5, ymin=0, ymax=6.5)
+```
+
+
+```{r}
+df %>% drop_na(any_of(c("eryptosis", "BMI"))) %>% nrow()
+df %>% drop_na(any_of(c("eryptosis", "BMI"))) %>% filter(gender=="male") %>% nrow()
+df %>% drop_na(any_of(c("eryptosis", "BMI"))) %>% filter(gender=="female") %>% nrow()
+
+regression_correlation_marginal_hist_plot(data = df, 
+                                          formula_corr = bf(mvbind(eryptosis, BMI) ~ 1) + set_rescor(TRUE),
+                                          formula_reg  = bf(eryptosis ~ BMI),
+                                          conditional_effect_label = "BMI",
+                                          xlabel = "BMI [kg/m²]",
+                                          ylabel = "Eryptosis [%]",
+                                          color="gray",
+                                          title="total subcohort",
+                                          filename=here("eryptosis_ohd", 
+                                                        "plots", 
+                                                        "bmi_eryptosis_regression_all.tiff"),
+                                          xmin=15, xmax=65, ymin=0, ymax=6.5)
+
+regression_correlation_marginal_hist_plot(data = df %>% filter(gender=="male"), 
+                                          formula_corr = bf(mvbind(eryptosis, BMI) ~ 1) + set_rescor(TRUE),
+                                          formula_reg  = bf(eryptosis ~ BMI),
+                                          conditional_effect_label = "BMI",
+                                          xlabel = "BMI [kg/m²]",
+                                          ylabel = "Eryptosis [%]",
+                                          color=binary_colors[1],
+                                          title="male",
+                                          filename=here("eryptosis_ohd", 
+                                                        "plots", 
+                                                        "bmi_eryptosis_regression_ohd_male.tiff"),
+                                          xmin=15, xmax=65, ymin=0, ymax=6.5)
+
+regression_correlation_marginal_hist_plot(data = df %>% filter(gender=="female"), 
+                                          formula_corr = bf(mvbind(eryptosis, BMI) ~ 1) + set_rescor(TRUE),
+                                          formula_reg  = bf(eryptosis ~ BMI),
+                                          conditional_effect_label = "BMI",
+                                          xlabel = "BMI [kg/m²]",
+                                          ylabel = "Eryptosis [%]",
+                                          color=binary_colors[2],
+                                          title="female",
+                                          filename=here("eryptosis_ohd", 
+                                                        "plots", 
+                                                        "bmi_eryptosis_regression_ohd_female.tiff"),
+                                          xmin=16, xmax=65, ymin=0, ymax=6.5)
+```
+
+
+```{r}
+df %>% drop_na(any_of(c("eryptosis", "age"))) %>% nrow()
+df %>% drop_na(any_of(c("age", "OHD"))) %>% nrow()
+
+
+regression_correlation_marginal_hist_plot(data = df, 
+                                          formula_corr = bf(mvbind(eryptosis, age) ~ 1) + set_rescor(TRUE),
+                                          formula_reg  = bf(eryptosis ~ age),
+                                          conditional_effect_label = "age",
+                                          xlabel = "Age",
+                                          ylabel = "Eryptosis [%]",
+                                          color="gray",
+                                          title="",
+                                          filename=here("eryptosis_ohd", 
+                                                        "plots", 
+                                                        "age_eryptosis_regression.tiff"),
+                                          xmin=18, xmax=80, ymin=0, ymax=6.5)
+
+regression_correlation_marginal_hist_plot(data = df, 
+                                          formula_corr = bf(mvbind(OHD, age) ~ 1) + set_rescor(TRUE),
+                                          formula_reg  = bf(OHD ~ age),
+                                          conditional_effect_label = "age",
+                                          xlabel = "Age",
+                                          ylabel = "25(OH)D [nmol/l]",
+                                          color="gray",
+                                          title="",
+                                          filename=here("eryptosis_ohd", 
+                                                        "plots", 
+                                                        "age_ohd_regression.tiff"),
+                                          xmin=18, xmax=80, ymin=0, ymax=160)
+
+```
+
+
+```{r}
+m_eryptosis_ohd_groups = brm(
+  bf(eryptosis ~ 0 + OHD_grp, sigma ~ 0+OHD_grp),
+  data = df,
+  cores = 4, iter = 3000, warmup=1000, refresh=0
+)
+
+summary(m_eryptosis_ohd_groups)
+
+brms_uneq_robust_groups_post <- posterior_samples(m_eryptosis_ohd_groups) %>% 
+  mutate_at(vars(contains("sigma")), funs(exp)) %>% 
+  mutate(
+    diff_means_deficient_insufficient = b_OHD_grpdeficient - b_OHD_grpinsufficient,
+    diff_means_deficient_adequate = b_OHD_grpdeficient - b_OHD_grpadequate,
+    diff_means_insufficient_adequate = b_OHD_grpinsufficient - b_OHD_grpadequate,
+         ) %>% 
+  mutate(
+    d_deficient_insufficient = diff_means_deficient_insufficient / sqrt((b_sigma_OHD_grpdeficient + b_sigma_OHD_grpinsufficient)/2),
+    d_deficient_adequate = diff_means_deficient_adequate / sqrt((b_sigma_OHD_grpdeficient + b_sigma_OHD_grpadequate)/2),
+    d_insufficient_adequate = diff_means_insufficient_adequate / sqrt((b_sigma_OHD_grpinsufficient + b_sigma_OHD_grpadequate)/2),
+         )
+
+brms_uneq_robust_groups_tidy_fixed <- 
+  tidyMCMC(brms_uneq_robust_groups_post, conf.int = TRUE, conf.level = 0.95, 
+           estimate.method = "mean", conf.method = "HPDinterval")
+brms_uneq_robust_groups_tidy_fixed
+
+p = conditional_effects(m_eryptosis_ohd_groups, "OHD_grp")
+
+p$`OHD_grp`$effect1__ <- factor(p$`OHD_grp`$effect1__, c("deficient", "insufficient", "adequate"))
+p$`OHD_grp`$OHD_grp <- factor(p$`OHD_grp`$OHD_grp, c("deficient", "insufficient", "adequate"))
+
+
+plot(p, plot=FALSE)[[1]] + 
+  labs(x="Vitamin D status",
+       y="Eryptosis [%]")
+ggsave(here("eryptosis_ohd", "plots", "eryptosis_by_ohd_group.tiff"), width=6, height=3, dpi=dpi_value)
+
+plot(m_eryptosis_ohd_groups)
+
+
+mcmc_areas(m_eryptosis_ohd_groups, pars = c("b_OHD_grpadequate", "b_OHD_grpdeficient", "b_OHD_grpinsufficient"))
+```
+
+
+```{r}
+m_full = brm(
+  bf(eryptosis ~ age + reticulocytes + OHD + BMI + gender),
+  data = df,
+  cores = 4, iter = 6000, warmup=1000, refresh=0
+)
+
+plot(conditional_effects(m_full), ask=FALSE, points=FALSE)
+
+plot(m_full)
+
+print(summary(m_full), digits=3)
+```
+
+
+## Group comparisons
+
+```{r}
+# OHD and Gender
+m_meancomp_ohd_gender = brm(
+  bf(OHD ~ 0 + gender, sigma ~ 0 + gender),
+  data = df,
+  cores = 4, iter = 3000, warmup=1000, refresh=0
+)
+
+summary(m_meancomp_ohd_gender)
+
+mcmc_areas(m_meancomp_ohd_gender, pars=c("b_gendermale", "b_genderfemale"))
+
+brms_uneq_robust_groups_post <- posterior_samples(m_meancomp_ohd_gender) %>% 
+  mutate_at(vars(contains("sigma")), funs(exp)) %>% 
+  mutate(diff_means = b_genderfemale - b_gendermale,
+         diff_sigma = b_sigma_genderfemale - b_sigma_gendermale) %>% 
+  mutate(cohen_d = diff_means / sqrt((b_sigma_genderfemale + b_sigma_gendermale)/2),
+         cles = dnorm(diff_means / sqrt((b_sigma_genderfemale + b_sigma_gendermale)), 0, 1))
+
+brms_uneq_robust_groups_tidy_fixed <- 
+  tidyMCMC(brms_uneq_robust_groups_post, conf.int = TRUE, conf.level = 0.95, 
+           estimate.method = "mean", conf.method = "HPDinterval")
+brms_uneq_robust_groups_tidy_fixed
+
+```
+
+
+```{r}
+# Eryptosis and Gender
+m_meancomp_eryptosis_gender = brm(
+  bf(eryptosis ~ 0 + gender, sigma ~ 0 + gender),
+  data = df,
+  cores = 4, iter = 3000, warmup=1000, refresh=0
+)
+
+summary(m_meancomp_eryptosis_gender)
+
+mcmc_areas(m_meancomp_ohd_gender, pars=c("b_gendermale", "b_genderfemale"))
+
+brms_uneq_robust_groups_post <- posterior_samples(m_meancomp_eryptosis_gender) %>% 
+  mutate_at(vars(contains("sigma")), funs(exp)) %>% 
+  mutate(diff_means = b_genderfemale - b_gendermale,
+         diff_sigma = b_sigma_genderfemale - b_sigma_gendermale) %>% 
+  mutate(cohen_d = diff_means / sqrt((b_sigma_genderfemale + b_sigma_gendermale)/2),
+         cles = dnorm(diff_means / sqrt((b_sigma_genderfemale + b_sigma_gendermale)), 0, 1))
+
+brms_uneq_robust_groups_tidy_fixed <- 
+  tidyMCMC(brms_uneq_robust_groups_post, conf.int = TRUE, conf.level = 0.95, 
+           estimate.method = "mean", conf.method = "HPDinterval")
+brms_uneq_robust_groups_tidy_fixed
+
+
+```
+
+
+```{r}
+m_multiple = brm(
+  eryptosis ~ OHD + age + gender + BMI + reticulocytes,
+  data = df, cores = 4, iter = 3000, warmup=1000, refresh=0
+)
+
+plot(m_multiple)
+
+print(m_multiple, digits = 3)
+
+conditional_effects(m_multiple)
+```
+
+
